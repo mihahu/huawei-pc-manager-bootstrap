@@ -57,6 +57,15 @@ fn run_with<P: InstallerProcess>(
                 executable_file_path, status
             ));
             if !status.success() {
+                #[cfg(windows)]
+                if status.code() == Some(0xC000_0005_u32 as i32) {
+                    return Err(format!(
+                        "Installer {} exited with 0xC0000005 (access violation). \
+                         In Event Viewer, check Windows Logs > Application for \
+                         Application Error (1000) or Windows Error Reporting (1001).",
+                        executable_file_path
+                    ));
+                }
                 return Err(format!(
                     "Installer {} exited unsuccessfully: {}",
                     executable_file_path, status
@@ -188,6 +197,25 @@ mod tests {
         let error = result.unwrap_err();
         assert!(error.contains("exited unsuccessfully"));
         assert!(error.contains("17"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn access_violation_reports_crash_events_and_stops_installation() {
+        let error = run_with(
+            "setup.exe",
+            || Ok(fake([Ok(Some(status(0xC000_0005)))])),
+            || panic!("must not inspect the installation after a crash"),
+            || panic!("must not patch after a crash"),
+            || panic!("must not sleep after a crash"),
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert!(error.contains("setup.exe"));
+        assert!(error.contains("0xC0000005 (access violation)"));
+        assert!(error.contains("Application Error (1000)"));
+        assert!(error.contains("Windows Error Reporting (1001)"));
     }
 
     #[test]
