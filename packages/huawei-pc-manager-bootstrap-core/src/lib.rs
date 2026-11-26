@@ -8,17 +8,6 @@ use tracing_subscriber::{prelude::*, util::SubscriberInitExt};
 
 #[no_mangle]
 pub unsafe extern "system" fn enable_hook(opts_ptr: *const INJECT_OPTIONS_WRAPPER) {
-    // Pin this module before installing any hook: the injector's
-    // InjectionGuard calls FreeLibrary on the injected core DLL right after
-    // enable_hook returns, but our inline detours (retour::static_detour)
-    // point into this DLL's code section. Without pinning, the first
-    // GetSystemFirmwareTable call would jump into freed memory and crash the
-    // installer with 0xc0000005.
-    let self_address = enable_hook as *const () as *const core::ffi::c_void;
-    if let Err(err) = common::common::pin_module(self_address) {
-        error!("Failed to pin module: {}", err);
-    }
-
     let opts: Option<InjectOptions> = if opts_ptr.is_null() || (*opts_ptr).len == 0 {
         None
     } else {
@@ -29,12 +18,22 @@ pub unsafe extern "system" fn enable_hook(opts_ptr: *const INJECT_OPTIONS_WRAPPE
     opts.as_ref()
         .and_then(|opts| opts.server_address.as_ref())
         .and_then(|addr| InterProcessComClient::connect(addr).ok())
-        .map(|client| {
-            // log::set_max_level(LevelFilter::Info);
-            tracing_subscriber::registry().with(client).init();
-        })
+        .map(|client| tracing_subscriber::registry().with(client).try_init().ok())
+        .flatten()
         .or_else(|| initialize_file_logger().ok());
 
+    // InjectionGuard releases this DLL on return; callbacks must stay resident.
+    let self_address = enable_hook as *const () as *const core::ffi::c_void;
+    if let Err(err) = common::common::pin_module(self_address) {
+        error!("Failed to pin module; hooks were not installed: {}", err);
+        return;
+    }
+
+    info!(
+        "Core startup: pid={}, architecture={}",
+        std::process::id(),
+        std::env::consts::ARCH
+    );
     info!("Enabling hook ...");
     if let Err(err) = common::common::enable_hook(opts) {
         error!("{}", err);
@@ -49,9 +48,14 @@ pub fn initialize_file_logger() -> anyhow::Result<()> {
 
     let mut log_file_path = cache_dir.to_path_buf();
     let now = chrono::Local::now();
-    log_file_path.push(format!("core-{}.log", now.format("%Y%m%d%H%M%S")));
+    log_file_path.push(format!(
+        "core-{}-{}.log",
+        std::process::id(),
+        now.format("%Y%m%d%H%M%S")
+    ));
 
     tracing_subscriber::fmt::fmt()
+        .with_ansi(false)
         .with_writer(File::create(log_file_path)?)
         .try_init()
         .map_err(|err| anyhow::anyhow!("error: {}", err))?;

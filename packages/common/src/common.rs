@@ -1,8 +1,8 @@
 use injectors::{options::InjectOptions, process::ProcessHandle};
 use retour::static_detour;
 use std::{
-    ffi::{c_void, CStr, CString},
-    intrinsics::transmute,
+    ffi::{c_void, CString},
+    mem::transmute,
     slice::{from_raw_parts, from_raw_parts_mut},
     sync::Mutex,
 };
@@ -24,46 +24,13 @@ use windows_sys::{
     },
 };
 
-use crate::config::{get_firmware_config, Config};
+use crate::{
+    config::{get_firmware_config, Config},
+    smbios::{copy_firmware_table, rewrite_system_info},
+};
 
 const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x0000_0001;
 const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
-
-#[repr(C)]
-#[derive(Clone)]
-#[allow(non_snake_case)]
-pub struct RawSMBIOSData {
-    pub Used20CallingMethod: u8,
-    pub SMBIOSMajorVersion: u8,
-    pub SMBIOSMinorVersion: u8,
-    pub DmiRevision: u8,
-    pub Length: u32,
-    pub SMBIOSTableData: [u8; 0],
-}
-
-#[repr(C)]
-#[derive(Clone, Default)]
-#[allow(non_snake_case)]
-pub struct SMBIOSHEADER {
-    pub Type: u8,
-    pub Length: u8,
-    pub Handle: u16,
-}
-
-#[repr(C)]
-#[derive(Clone, Default)]
-#[allow(non_snake_case)]
-pub struct SystemInfo {
-    pub Header: SMBIOSHEADER,
-    pub Manufacturer: u8,
-    pub ProductName: u8,
-    pub Version: u8,
-    pub SN: u8,
-    pub UUID: [u8; 16],
-    pub WakeUpType: u8,
-    pub SKUNumber: u8,
-    pub Family: u8,
-}
 
 type FnCreateProcessW = unsafe extern "system" fn(
     PCWSTR,
@@ -161,67 +128,30 @@ fn get_and_cache_firmware_table() -> anyhow::Result<()> {
             std::io::Error::last_os_error()
         ));
     }
+    anyhow::ensure!(
+        buffer_size as usize <= buffer.len(),
+        "Firmware table grew during the query; retry required"
+    );
+    buffer.truncate(buffer_size as usize);
+    let config = get_firmware_config().unwrap_or_else(|err| {
+        warn!("Using default firmware identity: {}", err);
+        Config::default()
+    });
+    let custom = rewrite_system_info(&buffer, &config)?;
+    info!(
+        "Firmware identity prepared: manufacturer={}, product={}, original_size={}, patched_size={}",
+        config.manufacturer,
+        config.product_name,
+        buffer.len(),
+        custom.len()
+    );
 
     CUSTOM_SMBIOS_BUFFER
         .lock()
         .map_err(|err| anyhow::anyhow!("Failed to lock custom smbios data buffer: {}", err))?
-        .replace(replace_smbios_manufacturer(buffer));
+        .replace(custom);
 
     Ok(())
-}
-
-fn replace_smbios_manufacturer(mut smbios_data: Vec<u8>) -> Vec<u8> {
-    unsafe {
-        let raw_bios_ptr = smbios_data.as_mut_ptr() as *mut RawSMBIOSData;
-        let start_entry_ptr: *mut u8 =
-            &(*raw_bios_ptr).SMBIOSTableData as *const [u8; 0] as *mut u8;
-        let end_ptr = start_entry_ptr.add((*raw_bios_ptr).Length as usize);
-        let mut header_ptr: *mut SMBIOSHEADER = transmute(start_entry_ptr);
-        let mut smbios_entry_list: Vec<Vec<u8>> = vec![];
-
-        while (header_ptr as usize) < end_ptr as usize {
-            let mut next_header = (header_ptr as *const u8).offset((*header_ptr).Length.into());
-            while 0 != (*next_header | *(next_header.offset(1)))
-                && (next_header as usize) < end_ptr as usize
-            {
-                next_header = next_header.offset(1);
-            }
-            next_header = next_header.offset(2);
-
-            let header_length =
-                std::cmp::min(next_header as usize, end_ptr as usize) - (header_ptr as usize);
-            if header_length > 0 {
-                smbios_entry_list
-                    .push(from_raw_parts(header_ptr as *const u8, header_length).to_vec());
-            }
-
-            header_ptr = next_header as *mut SMBIOSHEADER;
-        }
-
-        let mut custom_smbios_data =
-            smbios_data[..start_entry_ptr as usize - raw_bios_ptr as usize].to_vec();
-        custom_smbios_data.append(
-            &mut smbios_entry_list
-                .into_iter()
-                .map(|entry| {
-                    if entry.first() == Some(&1) {
-                        let new_sys_entry = construct_own_sys_info(
-                            &get_firmware_config().unwrap_or_else(|_| Config::default()),
-                        );
-                        dump_sys_info(&*(new_sys_entry.as_ptr() as *const SystemInfo));
-                        new_sys_entry
-                    } else {
-                        entry
-                    }
-                })
-                .fold(vec![], |mut vec, mut entry| {
-                    vec.append(&mut entry);
-                    vec
-                }),
-        );
-
-        custom_smbios_data
-    }
 }
 
 fn detour_get_system_firmware_table(
@@ -250,15 +180,18 @@ fn detour_get_system_firmware_table(
                     if let Some(buffer) = buffer.as_ref() {
                         if pfirmwaretablebuffer as usize == 0 {
                             info!("Need {} bytes buffer", buffer.len());
-                            return buffer.len() as u32;
+                            return copy_firmware_table(buffer, None);
+                        }
+                        if (buffersize as usize) < buffer.len() {
+                            info!("Firmware buffer too small; need {} bytes", buffer.len());
+                            return copy_firmware_table(buffer, None);
                         }
                         let dest: &mut [u8] = unsafe {
                             from_raw_parts_mut(pfirmwaretablebuffer as *mut u8, buffersize as usize)
                         };
-                        let min_size = std::cmp::min(dest.len(), buffer.len());
-                        dest.copy_from_slice(&buffer[0..min_size]);
-                        info!("Copied {} bytes from buffer", min_size);
-                        return min_size as u32;
+                        let size = copy_firmware_table(buffer, Some(dest));
+                        info!("Copied {} bytes from firmware buffer", size);
+                        return size;
                     }
                     error!("Failed to get custom smbios buffer");
                 }
@@ -272,7 +205,7 @@ fn detour_get_system_firmware_table(
                 cache_smbios_buffer_result.unwrap_err()
             );
         }
-        return 0;
+        warn!("Firmware patch unavailable; forwarding the original query");
     }
 
     unsafe {
@@ -283,98 +216,6 @@ fn detour_get_system_firmware_table(
             buffersize,
         )
     }
-}
-
-fn dump_sys_info(sys_info: &SystemInfo) {
-    let first_str_ptr = unsafe {
-        (sys_info as *const SystemInfo as *const u8).add(sys_info.Header.Length as usize)
-    };
-    info!(
-        "Manufacturer: {}",
-        locate_string(first_str_ptr, sys_info.Manufacturer)
-            .unwrap_or_else(|| String::from("No Manufacturer"))
-    );
-    info!(
-        "ProductName: {}",
-        locate_string(first_str_ptr, sys_info.ProductName)
-            .unwrap_or_else(|| String::from("No ProductName"))
-    );
-    info!(
-        "Version: {}",
-        locate_string(first_str_ptr, sys_info.Version)
-            .unwrap_or_else(|| String::from("No Version"))
-    );
-    info!(
-        "SN: {}",
-        locate_string(first_str_ptr, sys_info.SN).unwrap_or_else(|| String::from("No SN"))
-    );
-}
-
-fn construct_own_sys_info(config: &Config) -> Vec<u8> {
-    let sys_info_data = format!(
-        "{}\0{}\0{}\0{}\0{}\0\0",
-        config.manufacturer, config.product_name, config.version, config.sn, config.sku
-    );
-
-    let mut sys_info = SystemInfo::default();
-
-    sys_info.Header.Length = std::mem::size_of_val(&sys_info) as u8;
-    sys_info.Header.Type = 1;
-    sys_info.Header.Handle = 1;
-
-    sys_info.Manufacturer = 1;
-    sys_info.ProductName = 2;
-    sys_info.Version = 3;
-    sys_info.SN = 4;
-    sys_info.SKUNumber = 5;
-
-    sys_info.WakeUpType = 0;
-    sys_info.SKUNumber = 0;
-    sys_info.Family = 0;
-    sys_info.UUID = [0; 16];
-
-    let mut entry_data = vec![];
-
-    entry_data.append(&mut unsafe {
-        from_raw_parts(
-            &sys_info as *const SystemInfo as *const u8,
-            std::mem::size_of_val(&sys_info),
-        )
-        .to_vec()
-    });
-    entry_data.append(&mut sys_info_data.as_bytes().to_vec());
-    entry_data
-}
-
-fn locate_string(oem_str: *const u8, index: u8) -> Option<String> {
-    if index == 0 || unsafe { *oem_str } == 0 {
-        return None;
-    }
-    let mut i = index;
-    let mut str_ptr = oem_str;
-    loop {
-        i -= 1;
-        if i == 0 {
-            break;
-        }
-        str_ptr = unsafe { str_ptr.add(str_len(str_ptr) + 1) }
-    }
-    Some(
-        unsafe { CStr::from_ptr(str_ptr as *const i8) }
-            .to_str()
-            .ok()?
-            .to_string(),
-    )
-}
-
-fn str_len(cstr: *const u8) -> usize {
-    let mut current_ptr = cstr;
-    let mut count = 0;
-    while unsafe { *current_ptr != 0 } {
-        count += 1;
-        current_ptr = unsafe { current_ptr.offset(1) };
-    }
-    count
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -464,7 +305,12 @@ fn detour_create_process(
                 let process = ProcessHandle::from_handle((*proc_info).hProcess);
                 let inject_result = process.inject_to_process(opts, LIBRARY_NAME);
                 if let Err(err) = inject_result {
-                    warn!("inject_to_process error: {}", err);
+                    // The dependency labels architecture mismatches "Bincode Error".
+                    warn!(
+                        "inject_to_process error for pid {}: {:?}",
+                        (*proc_info).dwProcessId,
+                        err
+                    );
                 }
             } else {
                 info!("Skip system process.");
@@ -486,10 +332,6 @@ pub fn enable_hook(opts: Option<InjectOptions>) -> anyhow::Result<()> {
         .map(|opts| opts.inject_sub_process)
         .unwrap_or(false);
     unsafe {
-        let fp_create_process: FnCreateProcessW =
-            transmute(get_proc_address("CreateProcessW", "kernel32.dll")?);
-        info!("Got CreateProcessW: 0x{:x}", fp_create_process as usize);
-
         let fp_get_system_firmware_table: FnGetSystemFirmwareTable =
             transmute(get_proc_address("GetSystemFirmwareTable", "kernel32.dll")?);
         info!(
@@ -497,41 +339,46 @@ pub fn enable_hook(opts: Option<InjectOptions>) -> anyhow::Result<()> {
             fp_get_system_firmware_table as usize
         );
 
-        let opts = Box::leak(Box::new(opts));
         HookGetSystemFirmwareTable.initialize(
             fp_get_system_firmware_table,
             detour_get_system_firmware_table,
         )?;
         info!("HookGetSystemFirmwareTable initialized");
 
-        HookCreateProcessW.initialize(
-            fp_create_process,
-            |app_name,
-             cmd_line,
-             proc_attrs,
-             th_attrs,
-             inherit,
-             flags,
-             env,
-             cur_dir,
-             startup_info,
-             proc_info| {
-                detour_create_process(
-                    opts,
-                    app_name,
-                    cmd_line,
-                    proc_attrs,
-                    th_attrs,
-                    inherit,
-                    flags,
-                    env,
-                    cur_dir,
-                    startup_info,
-                    proc_info,
-                )
-            },
-        )?;
-        info!("HookCreateProcessW initialized");
+        if inject_sub_process {
+            let fp_create_process: FnCreateProcessW =
+                transmute(get_proc_address("CreateProcessW", "kernel32.dll")?);
+            info!("Got CreateProcessW: 0x{:x}", fp_create_process as usize);
+            let opts = Box::leak(Box::new(opts));
+            HookCreateProcessW.initialize(
+                fp_create_process,
+                |app_name,
+                 cmd_line,
+                 proc_attrs,
+                 th_attrs,
+                 inherit,
+                 flags,
+                 env,
+                 cur_dir,
+                 startup_info,
+                 proc_info| {
+                    detour_create_process(
+                        opts,
+                        app_name,
+                        cmd_line,
+                        proc_attrs,
+                        th_attrs,
+                        inherit,
+                        flags,
+                        env,
+                        cur_dir,
+                        startup_info,
+                        proc_info,
+                    )
+                },
+            )?;
+            info!("HookCreateProcessW initialized");
+        }
         HookGetSystemFirmwareTable.enable()?;
         info!("HookGetSystemFirmwareTable enabled");
 

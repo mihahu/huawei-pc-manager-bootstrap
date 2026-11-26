@@ -21,18 +21,23 @@ pub fn initialize() -> anyhow::Result<bool> {
         eprintln!("Failed to initialize logger: {}", err);
     }
 
-    match common::common::enable_hook(Some(InjectOptions {
+    info!(
+        "Runtime patch startup: executable={}, pid={}, architecture={}",
+        std::env::current_exe()?.display(),
+        std::process::id(),
+        std::env::consts::ARCH
+    );
+    // Even a partial hook installation must not leave callbacks in an unloaded DLL.
+    unsafe {
+        common::common::pin_module(DllMain as *const () as *const core::ffi::c_void)?;
+    }
+    common::common::enable_hook(Some(InjectOptions {
         server_address: None,
         inject_sub_process: false,
         includes_system_process: false,
-    })) {
-        Ok(_) => {
-            info!("Version hooks installed");
-        }
-        Err(err) => {
-            error!("Enabling hook failed: {}", err);
-        }
-    }
+    }))
+    .map_err(|err| anyhow::anyhow!("Enabling runtime hook failed: {}", err))?;
+    info!("Version hooks installed");
 
     Ok(true)
 }
@@ -59,6 +64,7 @@ fn initialize_logger() -> anyhow::Result<()> {
     ));
 
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_writer(
             OpenOptions::new()
                 .append(true)
