@@ -2,10 +2,10 @@ name: Windows build and tests
 
 on:
   push:
-    branches: [master]
+    branches: [master, pcmanager14-adaptation]
     tags: ['v*']
   pull_request:
-    branches: [master]
+    branches: [master, pcmanager14-adaptation]
   workflow_dispatch:
 
 permissions:

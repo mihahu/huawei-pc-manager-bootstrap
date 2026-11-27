@@ -6,7 +6,7 @@ have not been reproduced by the automated tests.
 
 ## Automated checks
 
-The Windows workflow targets `master`, builds with the pinned nightly and locked
+The Windows workflow targets `master` and `pcmanager14-adaptation`, builds with the pinned nightly and locked
 dependencies, runs installer/elevation regression tests, and verifies:
 
 - `version.dll` is AMD64 (x64) and the embedded patch regression test agrees
